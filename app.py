@@ -115,6 +115,29 @@ class Store:
               entity_id TEXT NOT NULL,
               details_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS issuance_batches (
+              id TEXT PRIMARY KEY,
+              issuer TEXT NOT NULL,
+              template_id INTEGER NOT NULL REFERENCES templates(id),
+              total INTEGER NOT NULL,
+              issued_count INTEGER NOT NULL,
+              replayed_count INTEGER NOT NULL,
+              rejected_count INTEGER NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS issuance_batch_rows (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              batch_id TEXT NOT NULL REFERENCES issuance_batches(id),
+              line_no INTEGER NOT NULL,
+              holder_id TEXT NOT NULL,
+              business_key TEXT NOT NULL,
+              claims_json TEXT,
+              status TEXT NOT NULL CHECK(status IN ('issued','replayed','rejected')),
+              condition_code TEXT,
+              reason TEXT,
+              credential_id INTEGER,
+              duplicate_of_line INTEGER
+            );
             """
         )
         self.conn.commit()
@@ -127,6 +150,40 @@ class Store:
 
     def close(self) -> None:
         self.conn.close()
+
+    def save_batch(self, batch: dict, rows: list[dict]) -> None:
+        """整批记录一次落库；错误行同样保留逐行判定，但不会有凭证记录。"""
+        summary = batch["summary"]
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO issuance_batches(id,issuer,template_id,total,issued_count,replayed_count,rejected_count,created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (batch["id"], batch["issuer"], batch["template_id"], summary["total"], summary["issued"],
+                 summary["replayed"], summary["rejected"], batch["created_at"]),
+            )
+            self.conn.executemany(
+                """INSERT INTO issuance_batch_rows(batch_id,line_no,holder_id,business_key,claims_json,status,condition_code,reason,credential_id,duplicate_of_line)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                [
+                    (batch["id"], row["line_no"], row["holder_id"], row["business_key"],
+                     json.dumps(row["claims"], ensure_ascii=False) if row["claims"] is not None else None,
+                     row["status"], row["condition"], row["reason"], row["credential_id"], row["duplicate_of_line"])
+                    for row in rows
+                ],
+            )
+
+    def get_batch(self, batch_id: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM issuance_batches WHERE id=?", (batch_id,)).fetchone()
+
+    def get_batch_rows(self, batch_id: str) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM issuance_batch_rows WHERE batch_id=? ORDER BY id", (batch_id,)
+        ).fetchall()
+
+    def list_batches(self, issuer: str) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM issuance_batches WHERE issuer=? ORDER BY created_at DESC, id DESC LIMIT 100", (issuer,)
+        ).fetchall()
 
 
 class CredentialService:
@@ -379,7 +436,13 @@ class CredentialService:
 
     def state(self) -> dict:
         credentials = [self._credential_dict(row) for row in self.conn.execute("SELECT * FROM credentials ORDER BY id DESC")]
-        templates = [dict(row) for row in self.conn.execute("SELECT id,issuer,code,name,status,validity_days FROM templates ORDER BY id DESC")]
+        templates = []
+        for row in self.conn.execute("SELECT * FROM templates ORDER BY id DESC"):
+            templates.append({
+                "id": row["id"], "issuer": row["issuer"], "code": row["code"], "name": row["name"],
+                "status": row["status"], "validity_days": row["validity_days"],
+                "fields": json.loads(row["fields_json"]),
+            })
         audits = [dict(row) for row in self.conn.execute("SELECT at,actor,action,entity_type,entity_id,details_json FROM audit_log ORDER BY id DESC LIMIT 30")]
         return {"templates": templates, "credentials": credentials, "audits": audits}
 
@@ -392,6 +455,7 @@ class CredentialService:
 
 class Handler(BaseHTTPRequestHandler):
     service: CredentialService
+    batches: "BatchService"
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -423,6 +487,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"status": "ok"})
             if parts == ["api", "state"]:
                 return self._json(200, self.service.state())
+            if parts == ["api", "batches"]:
+                actor, role = self.headers.get("X-Actor"), self.headers.get("X-Role")
+                return self._json(200, self.batches.list_batches(actor, role))
+            if len(parts) == 3 and parts[:2] == ["api", "batches"]:
+                actor, role = self.headers.get("X-Actor"), self.headers.get("X-Role")
+                return self._json(200, self.batches.get(actor, role, parts[2]))
             if not parts:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes()
                 self.send_response(200)
@@ -458,6 +528,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.resolve_dispute(actor, role, int(parts[2]), body.get("decision", ""), body.get("resolution", ""))
             elif parts == ["api", "verify"]:
                 result = self.service.verify(body.get("token", ""), body.get("at"), bool(body.get("online", True)))
+            elif parts == ["api", "batches"]:
+                result = self.batches.submit(actor, role, body.get("template_id"), body.get("rows_text"))
             else:
                 raise ApiError(404, "接口不存在")
             self._json(200, result)
@@ -470,17 +542,25 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run(port: int, db_path: str, seed: bool) -> None:
+    from batch import BatchService
+
     store = Store(db_path)
     service = CredentialService(store)
     if seed:
         service.seed()
     Handler.service = service
+    Handler.batches = BatchService(service)
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"digital credentials listening on http://127.0.0.1:{port}")
     server.serve_forever()
 
 
 def main() -> None:
+    # 以脚本方式启动时本模块名是 __main__，而 batch.py 用 `from app import ...`
+    # 会再次导入本文件，产生第二份 ApiError，导致跨模块的异常无法被处理器捕获。
+    # 把运行中的模块注册为 "app"，保证全进程只有一份定义。
+    if __name__ == "__main__" and "app" not in sys.modules:
+        sys.modules["app"] = sys.modules[__name__]
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8211)
     parser.add_argument("--db", default=str(DB_PATH))

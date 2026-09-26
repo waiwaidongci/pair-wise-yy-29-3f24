@@ -1,5 +1,229 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>数字凭证服务</title>
-<style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style>
-<h1>数字凭证签发与验证</h1><p>通过 JSON API 完成模板创建、签发、最少披露、验证和撤销。身份由 <code>X-Actor</code> 与 <code>X-Role</code> 请求头模拟。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre>
-<script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>数字凭证批量签发台</title>
+<style>
+  :root { --line:#d8dde3; --muted:#6b7280; --ok:#0a7a42; --okbg:#e7f6ee;
+          --replay:#92600a; --replaybg:#fdf3dc; --bad:#b3261e; --badbg:#fdecea; }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.5 system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width: 1080px; margin: 28px auto; padding: 0 20px; color: #1f2933; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  h2 { font-size: 17px; margin: 26px 0 10px; }
+  .sub { color: var(--muted); margin-top: 0; }
+  .card { border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin: 14px 0; }
+  label { display: block; font-size: 13px; color: #374151; margin: 10px 0 4px; }
+  input, select, textarea { width: 100%; font: inherit; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; }
+  textarea { min-height: 170px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; white-space: pre; }
+  .row { display: flex; gap: 14px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 200px; }
+  button { padding: 8px 18px; font: inherit; border-radius: 6px; border: 1px solid #2563eb;
+           background: #2563eb; color: #fff; cursor: pointer; }
+  button.ghost { background: #fff; color: #2563eb; }
+  .hint { font-size: 12.5px; color: var(--muted); margin: 4px 0 0; white-space: pre-wrap; }
+  .error { color: var(--bad); background: var(--badbg); border-radius: 6px; padding: 8px 12px; margin-top: 10px; display: none; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  th, td { border-bottom: 1px solid var(--line); padding: 7px 9px; text-align: left; vertical-align: top; }
+  th { font-weight: 600; background: #f6f8fa; white-space: nowrap; }
+  .tag { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12px; white-space: nowrap; }
+  .tag.issued   { color: var(--ok);     background: var(--okbg); }
+  .tag.replayed { color: var(--replay); background: var(--replaybg); }
+  .tag.rejected { color: var(--bad);    background: var(--badbg); }
+  td.reason, td.key { color: #4b5563; }
+  .counts { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0; }
+  .counts span { padding: 4px 14px; border-radius: 999px; font-size: 13px; }
+  .counts .t { background: #eef1f4; }
+  .counts .i { background: var(--okbg); color: var(--ok); }
+  .counts .r { background: var(--replaybg); color: var(--replay); }
+  .counts .x { background: var(--badbg); color: var(--bad); }
+  .muted { color: var(--muted); font-size: 13px; }
+  a { color: #2563eb; cursor: pointer; }
+  details { margin-top: 10px; }
+  pre { background: #f3f5f7; padding: 12px; overflow: auto; border-radius: 6px; font-size: 12.5px; max-height: 360px; }
+</style>
+
+<h1>数字凭证批量签发台</h1>
+<p class="sub">按模板从表格粘贴整批名单：每行一个持有人、声明字段和业务编号。提交后逐行看到「签出 / 沿用原单 / 被哪个条件挡住」，同批重复行沿用首次结果，错误行不落凭证记录。身份由 <code>X-Actor</code>、<code>X-Role</code> 请求头模拟。</p>
+
+<div class="card">
+  <div class="row">
+    <div>
+      <label>签发方身份（X-Actor）</label>
+      <input id="actor" value="issuer-demo">
+    </div>
+    <div>
+      <label>模板</label>
+      <select id="template"></select>
+      <p class="hint" id="tplHint"></p>
+    </div>
+  </div>
+
+  <label>粘贴名单（每行：持有人 ⇥ 声明字段… ⇥ 业务编号；可直接从 Excel / 表格粘贴，也支持逗号分隔，首行可以是表头）</label>
+  <textarea id="rowsText" placeholder="alice&#9;Alice&#9;计算机科学&#9;BIZ-2026-001"></textarea>
+  <p class="hint" id="colHint"></p>
+  <p>
+    <button onclick="submitBatch()">提交整批签发</button>
+    <button class="ghost" type="button" onclick="fillExample()">填入示例</button>
+  </p>
+  <div class="error" id="error"></div>
+</div>
+
+<div id="result" hidden>
+  <h2>本批结果 <span class="muted" id="batchMeta"></span></h2>
+  <div class="counts" id="counts"></div>
+  <div class="card" style="padding:6px 10px">
+    <table>
+      <thead><tr><th>行</th><th>持有人</th><th>结果</th><th>说明</th><th>业务编号</th><th>凭证</th></tr></thead>
+      <tbody id="resultRows"></tbody>
+    </table>
+  </div>
+</div>
+
+<h2>历史批次</h2>
+<div class="card" style="padding:6px 10px">
+  <table>
+    <thead><tr><th>提交时间</th><th>模板</th><th>总数</th><th>签出</th><th>沿用</th><th>挡住</th><th></th></tr></thead>
+    <tbody id="history"><tr><td colspan="7" class="muted">加载中…</td></tr></tbody>
+  </table>
+</div>
+
+<details>
+  <summary class="muted">原始状态（模板 / 凭证 / 审计）</summary>
+  <button class="ghost" type="button" onclick="loadState()" style="margin:8px 0">刷新状态</button>
+  <pre id="state">加载中...</pre>
+</details>
+
+<script>
+const LABEL = {
+  issued: "签出", replayed: "沿用原单", rejected: "挡住",
+  missing_holder: "持有人为空", missing_business_key: "业务编号为空", missing_fields: "声明不全",
+  bad_columns: "列数不符", active_credential_exists: "已有有效凭证",
+  invalid_row: "声明不合法", conflict: "冲突", forbidden: "无权限", rejected: "未通过"
+};
+let TEMPLATES = [];
+
+function headers() {
+  return {"Content-Type": "application/json", "X-Actor": actor.value, "X-Role": "issuer"};
+}
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+}
+async function api(path, options) {
+  const res = await fetch(path, options);
+  const body = await res.json();
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}
+
+async function loadState() {
+  const data = await api("/api/state");
+  state.textContent = JSON.stringify(data, null, 2);
+  TEMPLATES = data.templates.filter(t => t.status === "active");
+  const current = template.value;
+  template.innerHTML = TEMPLATES.length
+    ? TEMPLATES.map(t => `<option value="${t.id}">#${t.id} ${esc(t.code)} ${esc(t.name)}（${esc(t.issuer)}）</option>`).join("")
+    : `<option value="">当前签发方还没有可用模板</option>`;
+  if (current && TEMPLATES.some(t => String(t.id) === current)) template.value = current;
+  updateTemplateHint();
+  loadHistory();
+}
+
+function currentTemplate() {
+  return TEMPLATES.find(t => String(t.id) === template.value);
+}
+function updateTemplateHint() {
+  const t = currentTemplate();
+  if (!t) { colHint.textContent = ""; tplHint.textContent = ""; return; }
+  const fields = (t.fields || []).map(f => f.name + (f.required ? "（必填）" : "（选填）"));
+  tplHint.textContent = `模板 #${t.id}，有效期 ${t.validity_days} 天，归属 ${t.issuer}；声明字段：${fields.join("、") || "无"}`;
+  colHint.textContent = "列顺序：持有人 → " + ((t.fields || []).map(f => f.name).join(" → ") || "声明字段") + " → 业务编号（共 " + ((t.fields || []).length + 2) + " 列）。首行可以是表头。";
+}
+template.addEventListener("change", updateTemplateHint);
+actor.addEventListener("change", loadState);
+
+function fillExample() {
+  const t = currentTemplate();
+  const fields = (t && t.fields) ? t.fields.map(f => f.name) : ["name", "program"];
+  const sample = ["张三", "计算机科学", "本科", "优秀毕业生"];
+  const vals = (i, blank) => blank ? "" : (sample[i % sample.length]);
+  const header = ["持有人", ...fields, "业务编号"].join("\t");
+  rowsText.value = [
+    header,
+    ["stu-001", ...fields.map((_, i) => vals(i, false)), "BIZ-2026-001"].join("\t"),
+    ["stu-002", ...fields.map((_, i) => vals(i, false)), "BIZ-2026-002"].join("\t"),
+    ["stu-002", ...fields.map((_, i) => vals(i, false)), "BIZ-2026-002"].join("\t"),
+    ["stu-003", ...fields.map(() => ""), "BIZ-2026-003"].join("\t"),
+    ["", ...fields.map((_, i) => vals(i, false)), "BIZ-2026-004"].join("\t")
+  ].join("\n");
+}
+
+async function submitBatch() {
+  error.style.display = "none";
+  if (!template.value) { showError("请先选择模板"); return; }
+  try {
+    const batch = await api("/api/batches", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({template_id: Number(template.value), rows_text: rowsText.value})
+    });
+    renderResult(batch);
+    loadHistory();
+  } catch (e) { showError(e.message); }
+}
+function showError(msg) {
+  error.textContent = msg;
+  error.style.display = "block";
+}
+
+function renderResult(batch) {
+  result.hidden = false;
+  batchMeta.textContent = `#${batch.id.slice(0, 8)} · ${batch.created_at}`;
+  const s = batch.summary;
+  counts.innerHTML =
+    `<span class="t">总数 ${s.total}</span>` +
+    `<span class="i">签出 ${s.issued}</span>` +
+    `<span class="r">沿用原单 ${s.replayed}</span>` +
+    `<span class="x">挡住 ${s.rejected}</span>`;
+  resultRows.innerHTML = batch.rows.map(r => `
+    <tr>
+      <td>${r.line_no}</td>
+      <td>${esc(r.holder_id) || '<span class="muted">—</span>'}</td>
+      <td><span class="tag ${r.status}">${LABEL[r.status]}</span></td>
+      <td class="reason">${r.condition ? `<code>${esc(r.condition)}</code> · ` : ""}${esc(r.reason || "")}</td>
+      <td class="key">${esc(r.business_key) || '<span class="muted">—</span>'}${r.duplicate_of_line ? ` <span class="muted">(同第 ${r.duplicate_of_line} 行)</span>` : ""}</td>
+      <td>${r.credential_id ? `#${r.credential_id}` : '<span class="muted">—</span>'}</td>
+    </tr>`).join("");
+}
+
+async function loadHistory() {
+  try {
+    const data = await api("/api/batches", {headers: headers()});
+    history.innerHTML = data.batches.length ? data.batches.map(b => `
+      <tr>
+        <td>${esc(b.created_at)}</td>
+        <td>#${b.template_id}</td>
+        <td>${b.total}</td>
+        <td style="color:var(--ok)">${b.issued}</td>
+        <td style="color:var(--replay)">${b.replayed}</td>
+        <td style="color:var(--bad)">${b.rejected}</td>
+        <td><a onclick="viewBatch('${b.id}')">查看逐行结果</a></td>
+      </tr>`).join("")
+      : '<tr><td colspan="7" class="muted">还没有批次</td></tr>';
+  } catch (e) {
+    history.innerHTML = `<tr><td colspan="7" class="muted">${esc(e.message)}</td></tr>`;
+  }
+}
+async function viewBatch(id) {
+  try {
+    const batch = await api(`/api/batches/${id}`, {headers: headers()});
+    renderResult({id: batch.id, created_at: batch.created_at,
+      summary: {total: batch.total, issued: batch.issued, replayed: batch.replayed, rejected: batch.rejected},
+      rows: batch.rows});
+    result.scrollIntoView({behavior: "smooth"});
+  } catch (e) { showError(e.message); }
+}
+
+loadState();
+</script>
 </html>
