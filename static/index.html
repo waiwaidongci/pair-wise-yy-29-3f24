@@ -1,5 +1,283 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>数字凭证服务</title>
-<style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style>
-<h1>数字凭证签发与验证</h1><p>通过 JSON API 完成模板创建、签发、最少披露、验证和撤销。身份由 <code>X-Actor</code> 与 <code>X-Role</code> 请求头模拟。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre>
-<script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script>
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>数字凭证服务 · 批量签发台</title>
+<style>
+  :root { --line:#dfe3e8; --ok:#1a7f37; --reuse:#8a6d00; --bad:#c0392b; }
+  * { box-sizing: border-box; }
+  body { font:15px/1.5 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         max-width:1080px; margin:0 auto; padding:24px 20px 60px; color:#1f2328; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:#57606a; margin:0 0 16px; }
+  .bar { display:flex; gap:12px; align-items:center; flex-wrap:wrap;
+          border:1px solid var(--line); border-radius:8px; padding:10px 14px; background:#f8f9fb; margin-bottom:14px; }
+  .bar label { font-size:13px; color:#57606a; }
+  input, select, textarea, button { font:inherit; }
+  input[type=text], input[type=number], select { padding:6px 10px; border:1px solid var(--line); border-radius:6px; }
+  textarea { width:100%; min-height:200px; padding:10px 12px; border:1px solid var(--line); border-radius:8px;
+             font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:13px; white-space:pre; }
+  button { padding:7px 16px; border:1px solid #2f6fdb; background:#2f6fdb; color:#fff; border-radius:6px; cursor:pointer; }
+  button.secondary { background:#fff; color:#2f6fdb; }
+  button:disabled { opacity:.55; cursor:default; }
+  .tabs { display:flex; gap:4px; border-bottom:1px solid var(--line); margin-bottom:18px; }
+  .tabs button { border:none; background:none; color:#57606a; border-bottom:2px solid transparent;
+                 border-radius:0; padding:8px 14px; }
+  .tabs button.active { color:#1f2328; border-bottom-color:#2f6fdb; font-weight:600; }
+  section { display:none; }
+  section.active { display:block; }
+  .card { border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:16px; }
+  .hint { font-size:13px; color:#57606a; margin:6px 0 10px; }
+  .hint code, code { background:#eef1f4; padding:1px 5px; border-radius:4px; font-size:12.5px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+  .row label { font-size:13px; color:#57606a; }
+  .summary { display:flex; gap:10px; flex-wrap:wrap; margin:12px 0; }
+  .chip { border:1px solid var(--line); border-radius:20px; padding:4px 14px; font-size:13px; background:#fff; }
+  .chip b { font-size:15px; }
+  .chip.ok b { color:var(--ok); } .chip.reuse b { color:var(--reuse); } .chip.bad b { color:var(--bad); }
+  table { width:100%; border-collapse:collapse; font-size:13.5px; }
+  th, td { border:1px solid var(--line); padding:7px 10px; text-align:left; vertical-align:top; }
+  th { background:#f4f6f8; font-weight:600; }
+  td.num, th.num { text-align:right; }
+  .badge { display:inline-block; padding:1px 10px; border-radius:12px; font-size:12.5px; white-space:nowrap; }
+  .badge.issued { background:#e6f4ea; color:var(--ok); }
+  .badge.reused { background:#fdf4d8; color:var(--reuse); }
+  .badge.blocked { background:#fde8e6; color:var(--bad); }
+  .reason { color:#a33; }
+  .muted { color:#8a919b; }
+  .clickable { cursor:pointer; color:#2f6fdb; }
+  pre { background:#f3f5f7; padding:14px; border-radius:8px; overflow:auto; font-size:12.5px; max-height:520px; }
+  .msg { font-size:13.5px; margin:8px 0; }
+  .msg.err { color:var(--bad); } .msg.ok { color:var(--ok); }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:760px){ .grid2 { grid-template-columns:1fr; } }
+</style>
+<h1>数字凭证签发与验证</h1>
+<p class="sub">身份由 <code>X-Actor</code> / <code>X-Role</code> 请求头模拟。批量签发台支持按模板粘贴名单，逐行给出签出、沿用或挡住原因。</p>
+
+<div class="bar">
+  <label>当前身份</label>
+  <input type="text" id="actor" value="issuer-demo" style="width:170px">
+  <label>角色</label>
+  <select id="role">
+    <option value="issuer">issuer 签发方</option>
+    <option value="holder">holder 持有人</option>
+    <option value="regulator">regulator 监管方</option>
+  </select>
+  <span class="hint" style="margin:0">单张出示/验证等接口也按此身份调用。</span>
+</div>
+
+<div class="tabs">
+  <button data-tab="batch" class="active">批量签发台</button>
+  <button data-tab="batches">批次记录</button>
+  <button data-tab="single">单张签发 / 出示 / 验证</button>
+  <button data-tab="state">系统状态</button>
+</div>
+
+<section id="tab-batch" class="active">
+  <div class="card">
+    <div class="row">
+      <label>模板</label>
+      <select id="tpl" style="min-width:280px"></select>
+      <button class="secondary" id="fillHeader" type="button">填入示例表头</button>
+    </div>
+    <div class="hint" id="tplHint"></div>
+    <div class="hint">每行一条记录，制表符或英文逗号分隔；首行为表头，必须含 <code>业务编号</code>、<code>持有人</code> 两列，其余为模板声明字段。
+      同一批内重复的业务编号沿用首次结果；业务编号即幂等键，历史批次已签出的会沿用原单；字段不全等错误行不会产生凭证。</div>
+    <textarea id="roster" placeholder="业务编号&#9;持有人&#9;name&#9;program&#9;degree&#10;BIZ-001&#9;S2026001&#9;张三&#9;计算机&#9;工学学士&#10;BIZ-002&#9;S2026002&#9;李四&#9;数学&#9;"></textarea>
+    <div class="row" style="margin-top:12px">
+      <button id="submitBatch">提交批量签发</button>
+      <span class="msg" id="batchMsg"></span>
+    </div>
+    <div id="batchResult"></div>
+  </div>
+</section>
+
+<section id="tab-batches">
+  <div class="card">
+    <div class="row"><button id="loadBatches">刷新批次列表</button><span class="hint" style="margin:0">只显示本签发方的批次。</span></div>
+    <div style="overflow:auto"><table id="batchTable">
+      <thead><tr><th>批次</th><th>模板</th><th class="num">总数</th><th class="num">签出</th><th class="num">沿用</th><th class="num">挡住</th><th>提交时间</th></tr></thead>
+      <tbody><tr><td colspan="7" class="muted">尚未加载</td></tr></tbody>
+    </table></div>
+  </div>
+  <div class="card" id="batchDetail" style="display:none">
+    <div id="batchDetailHead" class="hint"></div>
+    <div style="overflow:auto"><table>
+      <thead><tr><th>行号</th><th>业务编号</th><th>持有人</th><th>结果</th><th>凭证号</th><th>说明 / 挡住原因</th></tr></thead>
+      <tbody id="batchDetailBody"></tbody>
+    </table></div>
+  </div>
+</section>
+
+<section id="tab-single">
+  <div class="grid2">
+    <div class="card">
+      <h3 style="margin-top:0">单张签发</h3>
+      <div class="row"><label>模板ID</label><input type="number" id="sTpl" style="width:90px"></div>
+      <div class="row"><label>持有人</label><input type="text" id="sHolder" style="width:180px"></div>
+      <div class="row"><label>幂等键</label><input type="text" id="sIdem" style="width:180px"></div>
+      <div class="row"><label>声明(JSON)</label></div>
+      <textarea id="sClaims" style="min-height:90px" placeholder='{"name":"张三","program":"计算机"}'></textarea>
+      <div class="row" style="margin-top:10px"><button id="doIssue">签发</button><span class="msg" id="issueMsg"></span></div>
+      <pre id="issueOut" hidden></pre>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">出示（最少披露）</h3>
+      <div class="row"><label>凭证ID</label><input type="number" id="pId" style="width:100px"></div>
+      <div class="row"><label>披露字段(逗号分隔，留空全披露)</label><input type="text" id="pFields" style="width:260px"></div>
+      <div class="row"><button id="doPresent">出示</button><span class="msg" id="presentMsg"></span></div>
+      <pre id="presentOut" hidden></pre>
+      <h3>验证令牌</h3>
+      <div class="row"><label>在线</label><select id="vOnline"><option value="true">在线</option><option value="false">离线</option></select></div>
+      <textarea id="vToken" style="min-height:80px" placeholder="粘贴出示返回的 token"></textarea>
+      <div class="row" style="margin-top:8px"><button id="doVerify">验证</button><span class="msg" id="verifyMsg"></span></div>
+      <pre id="verifyOut" hidden></pre>
+    </div>
+  </div>
+</section>
+
+<section id="tab-state">
+  <div class="card">
+    <button id="loadState">刷新状态</button>
+    <pre id="state">加载中...</pre>
+  </div>
+</section>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function headers(){ return {"Content-Type":"application/json", "X-Actor": $("actor").value.trim(), "X-Role": $("role").value}; }
+async function api(path, opts){
+  const res = await fetch(path, opts);
+  const data = await res.json().catch(() => ({}));
+  if(!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+  return data;
+}
+function setMsg(el, text, ok){ el.textContent = text; el.className = "msg " + (ok ? "ok" : "err"); }
+const OUTCOME = {issued:["签出","issued"], reused:["沿用原单","reused"], blocked:["挡住","blocked"]};
+
+let templates = [];
+async function loadTemplates(){
+  const state = await api("/api/state");
+  templates = state.templates || [];
+  $("tpl").innerHTML = templates.length
+    ? templates.map(t => `<option value="${t.id}">#${t.id} ${esc(t.code)} · ${esc(t.name)}（${t.status}）</option>`).join("")
+    : `<option value="">暂无模板</option>`;
+  renderTplHint();
+  return state;
+}
+function currentTemplate(){ return templates.find(t => String(t.id) === $("tpl").value); }
+function renderTplHint(){
+  const t = currentTemplate();
+  if(!t){ $("tplHint").textContent = ""; return; }
+  const req = (t.fields||[]).filter(f => f.required).map(f => f.name);
+  $("tplHint").innerHTML = `模板字段：${(t.fields||[]).map(f => `<code>${esc(f.name)}${f.required?" *":""}</code>`).join(" ")}
+    ${req.length ? `　必填：${req.map(esc).join("、")}` : ""}　有效期 ${t.validity_days} 天`;
+}
+$("tpl").addEventListener("change", renderTplHint);
+$("fillHeader").addEventListener("click", () => {
+  const t = currentTemplate(); if(!t) return;
+  $("roster").value = "业务编号\t持有人\t" + t.fields.map(f => f.name).join("\t");
+});
+
+function renderItems(items){
+  return `<table><thead><tr><th class="num">行号</th><th>业务编号</th><th>持有人</th><th>结果</th><th class="num">凭证号</th><th>说明 / 挡住原因</th></tr></thead><tbody>` +
+    items.map(it => {
+      const [label, cls] = OUTCOME[it.outcome] || [it.outcome, ""];
+      return `<tr><td class="num">${it.line_no}</td><td>${esc(it.ref)}</td><td>${esc(it.holder_id)}</td>
+        <td><span class="badge ${cls}">${label}</span></td>
+        <td class="num">${it.credential_id ?? ""}</td>
+        <td class="${it.outcome==="blocked"?"reason":""}">${esc(it.reason) || (it.outcome==="issued"?'<span class="muted">新签发</span>':"")}</td></tr>`;
+    }).join("") + "</tbody></table>";
+}
+
+$("submitBatch").addEventListener("click", async () => {
+  const btn = $("submitBatch"); btn.disabled = true; $("batchMsg").textContent = "提交中…"; $("batchMsg").className = "msg";
+  try {
+    const data = await api("/api/batches", {method:"POST", headers:headers(),
+      body: JSON.stringify({template_id: Number($("tpl").value), roster: $("roster").value})});
+    setMsg($("batchMsg"), `批次 #${data.id} 已完成：共 ${data.total_rows} 行`, true);
+    $("batchResult").innerHTML =
+      `<div class="summary">
+         <span class="chip ok">签出 <b>${data.issued_count}</b></span>
+         <span class="chip reuse">沿用 <b>${data.reused_count}</b></span>
+         <span class="chip bad">挡住 <b>${data.blocked_count}</b></span>
+         <span class="chip">总数 <b>${data.total_rows}</b></span>
+       </div>` + renderItems(data.items);
+    loadBatches().catch(()=>{});
+  } catch(e) {
+    setMsg($("batchMsg"), "整批未受理：" + e.message, false);
+    $("batchResult").innerHTML = "";
+  } finally { btn.disabled = false; }
+});
+
+async function loadBatches(){
+  const data = await api("/api/batches", {headers:headers()});
+  const body = $("batchTable").querySelector("tbody");
+  if(!data.batches.length){ body.innerHTML = `<tr><td colspan="7" class="muted">还没有批次</td></tr>`; return; }
+  body.innerHTML = data.batches.map(b =>
+    `<tr><td><span class="clickable" data-id="${b.id}">#${b.id}</span></td>
+      <td>${esc(b.template_code)} · ${esc(b.template_name)}</td>
+      <td class="num">${b.total_rows}</td><td class="num" style="color:var(--ok)">${b.issued_count}</td>
+      <td class="num" style="color:var(--reuse)">${b.reused_count}</td>
+      <td class="num" style="color:var(--bad)">${b.blocked_count}</td><td>${esc(b.created_at)}</td></tr>`).join("");
+  body.querySelectorAll(".clickable").forEach(el => el.addEventListener("click", () => showBatch(el.dataset.id)));
+}
+$("loadBatches").addEventListener("click", () => loadBatches().catch(e => setMsg($("batchMsg"), e.message, false)));
+async function showBatch(id){
+  const data = await api("/api/batches/" + id, {headers:headers()});
+  $("batchDetail").style.display = "";
+  $("batchDetailHead").innerHTML = `批次 <b>#${data.id}</b> · 模板 ${esc(data.template_code)}（${esc(data.template_name)}）·
+    提交于 ${esc(data.created_at)} · 总数 ${data.total_rows}，签出 ${data.issued_count}，沿用 ${data.reused_count}，挡住 ${data.blocked_count}`;
+  $("batchDetailBody").innerHTML = "";
+  $("batchDetail").querySelector("table").outerHTML =
+    `<div style="overflow:auto">${renderItems(data.items)}</div>`;
+}
+
+$("doIssue").addEventListener("click", async () => {
+  let claims = {};
+  try { claims = JSON.parse($("sClaims").value || "{}"); }
+  catch(e){ return setMsg($("issueMsg"), "声明不是合法 JSON", false); }
+  try {
+    const data = await api("/api/credentials", {method:"POST", headers:headers(),
+      body: JSON.stringify({template_id: Number($("sTpl").value), holder_id: $("sHolder").value,
+        idempotency_key: $("sIdem").value, claims})});
+    setMsg($("issueMsg"), `凭证 #${data.id}（${data.status}）`, true);
+    const out = $("issueOut"); out.hidden = false; out.textContent = JSON.stringify(data, null, 2);
+    $("pId").value = data.id;
+  } catch(e){ setMsg($("issueMsg"), e.message, false); }
+});
+$("doPresent").addEventListener("click", async () => {
+  const fields = $("pFields").value.trim() ? $("pFields").value.split(",").map(s => s.trim()).filter(Boolean) : null;
+  try {
+    const data = await api(`/api/credentials/${Number($("pId").value)}/present`,
+      {method:"POST", headers:headers(), body: JSON.stringify({disclosed_fields: fields})});
+    setMsg($("presentMsg"), "已生成令牌", true);
+    const out = $("presentOut"); out.hidden = false; out.textContent = JSON.stringify(data, null, 2);
+    $("vToken").value = data.token;
+  } catch(e){ setMsg($("presentMsg"), e.message, false); }
+});
+$("doVerify").addEventListener("click", async () => {
+  try {
+    const data = await api("/api/verify", {method:"POST", headers:headers(),
+      body: JSON.stringify({token: $("vToken").value.trim(), online: $("vOnline").value === "true"})});
+    setMsg($("verifyMsg"), "valid=" + data.valid + "，status=" + data.status, data.valid);
+    const out = $("verifyOut"); out.hidden = false; out.textContent = JSON.stringify(data, null, 2);
+  } catch(e){ setMsg($("verifyMsg"), e.message, false); }
+});
+
+async function loadState(){
+  const state = await loadTemplates();
+  $("state").textContent = JSON.stringify(state, null, 2);
+}
+$("loadState").addEventListener("click", loadState);
+document.querySelectorAll(".tabs button").forEach(btn => btn.addEventListener("click", () => {
+  document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("active", b === btn));
+  document.querySelectorAll("section").forEach(s => s.classList.toggle("active", s.id === "tab-" + btn.dataset.tab));
+  if(btn.dataset.tab === "batches") loadBatches().catch(e => setMsg($("batchMsg"), e.message, false));
+  if(btn.dataset.tab === "state") loadState().catch(()=>{});
+}));
+loadState().catch(e => $("state").textContent = "加载失败：" + e.message);
+</script>
 </html>

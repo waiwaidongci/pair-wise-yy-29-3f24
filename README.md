@@ -20,7 +20,12 @@ python3 app.py
 - `POST /api/verify`：验证令牌，可指定验证时间与在线/离线模式。
 - `POST /api/credentials/{id}/revoke`：签发方撤销凭证。
 - `POST /api/credentials/{id}/dispute`、`POST /api/disputes/{id}/resolve`：提出和处理撤销争议。
+- `POST /api/batches`：批量签发。请求体 `{template_id, roster}`，`roster` 为按模板粘贴的文本：首行表头必须含 `业务编号`、`持有人` 两列，其余列对应模板声明字段，支持制表符或英文逗号分隔。逐行返回 `issued`（新签出）、`reused`（沿用本批首次结果或历史原单，业务编号即幂等键）或 `blocked`（附挡住原因）；错误行不产生凭证，但逐行结果与计数都会落库。空名单、缺少必填列表头等结构性问题整批 400 拒绝，不落批次。
+- `GET /api/batches`：本签发方的批次列表（含每批签出/沿用/挡住计数）。
+- `GET /api/batches/{id}`：某批次的逐行结果。
 - `GET /api/state`、`GET /api/health`：查看状态和健康检查。
+
+首页（`GET /`）提供「批量签发台」和「批次记录」两个页面。职责按层分开：`parse_roster_text` 只解析文本，`BatchService` 只做逐行判定并复用 `CredentialService.issue` 完成单张签发，`Store.save_batch` 只负责批次与逐行结果落库；原单张签发、出示、验证接口不受影响。
 
 ## 测试
 

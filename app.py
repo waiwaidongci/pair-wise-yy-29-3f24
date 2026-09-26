@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import hashlib
 import hmac
+import io
 import json
 import os
 import secrets
@@ -115,6 +117,28 @@ class Store:
               entity_id TEXT NOT NULL,
               details_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS batch_issuances (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              issuer TEXT NOT NULL,
+              template_id INTEGER NOT NULL REFERENCES templates(id),
+              total_rows INTEGER NOT NULL,
+              issued_count INTEGER NOT NULL,
+              reused_count INTEGER NOT NULL,
+              blocked_count INTEGER NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS batch_items (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              batch_id INTEGER NOT NULL REFERENCES batch_issuances(id),
+              line_no INTEGER NOT NULL,
+              ref TEXT,
+              holder_id TEXT,
+              outcome TEXT NOT NULL CHECK(outcome IN ('issued','reused','blocked')),
+              credential_id INTEGER,
+              reason TEXT,
+              UNIQUE(batch_id, line_no)
+            );
+            CREATE INDEX IF NOT EXISTS idx_batch_items_batch ON batch_items(batch_id);
             """
         )
         self.conn.commit()
@@ -124,6 +148,69 @@ class Store:
             "INSERT INTO audit_log(at,actor,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)",
             (iso(), actor, action, entity_type, str(entity_id), json.dumps(details, ensure_ascii=False)),
         )
+
+    def save_batch(self, actor: str, template_id: int, rows: list[dict]) -> int:
+        """批次、逐行结果与审计在同一事务落库；错误行只进批次行表，不产生凭证。"""
+        with self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO batch_issuances(issuer,template_id,total_rows,issued_count,reused_count,blocked_count,created_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                (
+                    actor,
+                    template_id,
+                    len(rows),
+                    sum(1 for r in rows if r["outcome"] == "issued"),
+                    sum(1 for r in rows if r["outcome"] == "reused"),
+                    sum(1 for r in rows if r["outcome"] == "blocked"),
+                    iso(),
+                ),
+            )
+            batch_id = int(cur.lastrowid)
+            self.conn.executemany(
+                """INSERT INTO batch_items(batch_id,line_no,ref,holder_id,outcome,credential_id,reason)
+                   VALUES(?,?,?,?,?,?,?)""",
+                [
+                    (
+                        batch_id,
+                        r["line_no"],
+                        r.get("ref"),
+                        r.get("holder_id"),
+                        r["outcome"],
+                        r.get("credential_id"),
+                        r.get("reason"),
+                    )
+                    for r in rows
+                ],
+            )
+            self.audit(actor, "batch.issue", "batch", batch_id, {
+                "template_id": template_id,
+                "total": len(rows),
+                "issued": sum(1 for r in rows if r["outcome"] == "issued"),
+                "reused": sum(1 for r in rows if r["outcome"] == "reused"),
+                "blocked": sum(1 for r in rows if r["outcome"] == "blocked"),
+            })
+        return batch_id
+
+    def list_batches(self, issuer: str, limit: int = 100) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """SELECT b.*, t.code AS template_code, t.name AS template_name
+               FROM batch_issuances b JOIN templates t ON t.id=b.template_id
+               WHERE b.issuer=? ORDER BY b.id DESC LIMIT ?""",
+            (issuer, limit),
+        ).fetchall()
+
+    def get_batch(self, batch_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """SELECT b.*, t.code AS template_code, t.name AS template_name
+               FROM batch_issuances b JOIN templates t ON t.id=b.template_id
+               WHERE b.id=?""",
+            (batch_id,),
+        ).fetchone()
+
+    def get_batch_items(self, batch_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM batch_items WHERE batch_id=? ORDER BY line_no", (batch_id,)
+        ).fetchall()
 
     def close(self) -> None:
         self.conn.close()
@@ -379,7 +466,9 @@ class CredentialService:
 
     def state(self) -> dict:
         credentials = [self._credential_dict(row) for row in self.conn.execute("SELECT * FROM credentials ORDER BY id DESC")]
-        templates = [dict(row) for row in self.conn.execute("SELECT id,issuer,code,name,status,validity_days FROM templates ORDER BY id DESC")]
+        templates = [dict(row) for row in self.conn.execute("SELECT id,issuer,code,name,fields_json,status,validity_days FROM templates ORDER BY id DESC")]
+        for template in templates:
+            template["fields"] = json.loads(template.pop("fields_json"))
         audits = [dict(row) for row in self.conn.execute("SELECT at,actor,action,entity_type,entity_id,details_json FROM audit_log ORDER BY id DESC LIMIT 30")]
         return {"templates": templates, "credentials": credentials, "audits": audits}
 
@@ -390,8 +479,179 @@ class CredentialService:
             self.create_template("issuer-demo", "issuer", "student-v1", "学生身份", [{"name": "name", "required": True}, {"name": "program", "required": True}, {"name": "degree", "required": False}], 365)
 
 
+def parse_roster_text(text: str) -> tuple[list[str], list[dict]]:
+    """解析按模板粘贴的名单：首行表头（业务编号/持有人/声明字段），制表符或逗号分隔。
+
+    结构问题（空名单、缺少业务编号或持有人列）以带 _fatal 的行返回，
+    由批次判定层整批拒绝；列数不一致等记录级问题带 _error，记为挡住行；空行直接跳过。
+    """
+    raw_lines = [line for line in (text or "").splitlines()]
+    non_empty = [line for line in raw_lines if line.strip()]
+    if not non_empty:
+        return [], [{"line_no": 1, "_fatal": "名单为空"}]
+    header_line = non_empty[0]
+    delimiter = "\t" if "\t" in header_line else ","
+
+    def split(line: str) -> list[str]:
+        return [cell.strip() for cell in next(csv.reader(io.StringIO(line), delimiter=delimiter))]
+
+    headers = split(header_line)
+    if "业务编号" not in headers or "持有人" not in headers:
+        return headers, [{"line_no": 1, "_fatal": "表头必须包含「业务编号」和「持有人」两列"}]
+    rows: list[dict] = []
+    line_no = 1
+    for line in raw_lines[1:]:
+        line_no += 1
+        if not line.strip():
+            continue
+        cells = split(line)
+        if len(cells) != len(headers):
+            rows.append({"line_no": line_no, "_error": f"列数为 {len(cells)}，与表头 {len(headers)} 列不一致"})
+            continue
+        rows.append({"line_no": line_no, **dict(zip(headers, cells))})
+    return headers, rows
+
+
+class BatchService:
+    """批量签发：只负责逐行判定与批次记录，单张签发仍由 CredentialService.issue 承担。"""
+
+    def __init__(self, store: Store, credentials: CredentialService):
+        self.store = store
+        self.conn = store.conn
+        self.credentials = credentials
+
+    @staticmethod
+    def _block(line_no: int, ref: str | None, holder: str | None, reason: str) -> dict:
+        return {"line_no": line_no, "ref": ref or None, "holder_id": holder or None,
+                "outcome": "blocked", "credential_id": None, "reason": reason}
+
+    def submit(self, actor: str | None, role: str | None, template_id_raw: object, text: str) -> dict:
+        actor = CredentialService._required_actor(actor, role, "issuer")
+        try:
+            template_id = int(template_id_raw)
+        except (TypeError, ValueError) as exc:
+            raise ApiError(400, "模板编号无效") from exc
+        template = self.credentials._row("templates", template_id)
+        if template["issuer"] != actor:
+            raise ApiError(403, "不能使用其他签发方的模板")
+        if template["status"] != "active":
+            raise ApiError(409, "模板已停用")
+        field_names = [f["name"] for f in json.loads(template["fields_json"])]
+        headers, parsed = parse_roster_text(text)
+        extra_headers = [h for h in headers if h not in ("业务编号", "持有人", *field_names)]
+
+        fatal = next((r["_fatal"] for r in parsed if r.get("_fatal")), None)
+        if fatal:
+            raise ApiError(400, f"名单格式问题：{fatal}")
+
+        rows: list[dict] = []
+        first_by_ref: dict[str, dict] = {}
+        for row in parsed:
+            decided = self._decide_row(row, field_names, extra_headers, first_by_ref, template, actor)
+            rows.append(decided)
+            ref = decided.get("ref")
+            if ref and ref not in first_by_ref:
+                first_by_ref[ref] = decided
+
+        batch_id = self.store.save_batch(actor, template_id, rows)
+        return self.get_batch(actor, role, batch_id)
+
+    def _decide_row(
+        self,
+        row: dict,
+        field_names: list[str],
+        extra_headers: list[str],
+        first_by_ref: dict[str, dict],
+        template: sqlite3.Row,
+        actor: str,
+    ) -> dict:
+        line_no = int(row["line_no"])
+        if row.get("_error"):
+            return self._block(line_no, None, None, f"名单格式问题：{row['_error']}")
+        ref = str(row.get("业务编号", "")).strip()
+        holder = str(row.get("持有人", "")).strip()
+        if not ref:
+            return self._block(line_no, None, holder, "缺少业务编号")
+        if not holder:
+            return self._block(line_no, ref, None, "缺少持有人")
+        if extra_headers:
+            return self._block(line_no, ref, holder, f"存在模板外字段列：{extra_headers}")
+
+        first = first_by_ref.get(ref)
+        if first is not None:
+            if first.get("holder_id") != holder:
+                return self._block(line_no, ref, holder, "业务编号在本批重复，但持有人不一致")
+            if first["outcome"] == "blocked":
+                return self._block(line_no, ref, holder, f"与本批第 {first['line_no']} 行重复，该行被挡：{first['reason']}")
+            return {
+                "line_no": line_no, "ref": ref, "holder_id": holder,
+                "outcome": "reused", "credential_id": first["credential_id"],
+                "reason": f"沿用本批第 {first['line_no']} 行的签发结果",
+            }
+
+        claims = {name: str(row.get(name, "")).strip() for name in field_names}
+        # issue 命中幂等时返回的就是原单，先查是否早已存在以区分“签出”和“沿用原单”
+        existed = self.conn.execute(
+            "SELECT id FROM credentials WHERE template_id=? AND holder_id=? AND idempotency_key=?",
+            (template["id"], holder, ref),
+        ).fetchone()
+        try:
+            credential = self.credentials.issue(
+                actor, "issuer", int(template["id"]), holder, claims, ref
+            )
+        except ApiError as exc:
+            return self._block(line_no, ref, holder, exc.message)
+        if existed:
+            return {
+                "line_no": line_no, "ref": ref, "holder_id": holder,
+                "outcome": "reused", "credential_id": credential["id"],
+                "reason": "沿用此前相同业务编号的原单",
+            }
+        return {
+            "line_no": line_no, "ref": ref, "holder_id": holder,
+            "outcome": "issued", "credential_id": credential["id"], "reason": None,
+        }
+
+    def list_batches(self, actor: str | None, role: str | None) -> dict:
+        actor = CredentialService._required_actor(actor, role, "issuer")
+        batches = [self._batch_summary(row) for row in self.store.list_batches(actor)]
+        return {"batches": batches, "total": len(batches)}
+
+    def get_batch(self, actor: str | None, role: str | None, batch_id_raw: object) -> dict:
+        actor = CredentialService._required_actor(actor, role, "issuer")
+        try:
+            batch_id = int(batch_id_raw)
+        except (TypeError, ValueError) as exc:
+            raise ApiError(400, "批次编号无效") from exc
+        batch = self.store.get_batch(batch_id)
+        if not batch:
+            raise ApiError(404, "批次不存在")
+        if batch["issuer"] != actor:
+            raise ApiError(403, "只能查看本机构的批次")
+        items = [dict(row) for row in self.store.get_batch_items(batch_id)]
+        result = self._batch_summary(batch)
+        result["items"] = items
+        return result
+
+    @staticmethod
+    def _batch_summary(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "issuer": row["issuer"],
+            "template_id": row["template_id"],
+            "template_code": row["template_code"],
+            "template_name": row["template_name"],
+            "total_rows": row["total_rows"],
+            "issued_count": row["issued_count"],
+            "reused_count": row["reused_count"],
+            "blocked_count": row["blocked_count"],
+            "created_at": row["created_at"],
+        }
+
+
 class Handler(BaseHTTPRequestHandler):
     service: CredentialService
+    batch: BatchService
 
     def log_message(self, fmt: str, *args: object) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -419,10 +679,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         try:
             parts = self._parts()
+            actor, role = self.headers.get("X-Actor"), self.headers.get("X-Role")
             if parts == ["health"] or parts == ["api", "health"]:
                 return self._json(200, {"status": "ok"})
             if parts == ["api", "state"]:
                 return self._json(200, self.service.state())
+            if parts == ["api", "batches"]:
+                return self._json(200, self.batch.list_batches(actor, role))
+            if len(parts) == 3 and parts[:2] == ["api", "batches"]:
+                return self._json(200, self.batch.get_batch(actor, role, parts[2]))
             if not parts:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes()
                 self.send_response(200)
@@ -458,6 +723,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.resolve_dispute(actor, role, int(parts[2]), body.get("decision", ""), body.get("resolution", ""))
             elif parts == ["api", "verify"]:
                 result = self.service.verify(body.get("token", ""), body.get("at"), bool(body.get("online", True)))
+            elif parts == ["api", "batches"]:
+                result = self.batch.submit(actor, role, body.get("template_id"), body.get("roster", ""))
             else:
                 raise ApiError(404, "接口不存在")
             self._json(200, result)
@@ -475,6 +742,7 @@ def run(port: int, db_path: str, seed: bool) -> None:
     if seed:
         service.seed()
     Handler.service = service
+    Handler.batch = BatchService(store, service)
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"digital credentials listening on http://127.0.0.1:{port}")
     server.serve_forever()
